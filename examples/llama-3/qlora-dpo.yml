@@ -1,27 +1,37 @@
 base_model: meta-llama/Meta-Llama-3-8B
-model_type: LlamaForCausalLM
+model_type: AutoModelForCausalLM
 tokenizer_type: AutoTokenizer
 
-load_in_8bit: true
-load_in_4bit: false
+load_in_8bit: false
+load_in_4bit: true
 strict: false
 
+dpo_beta: 0.1
+rl: dpo
+
+# Data
 datasets:
-  - path: mhenrichsen/alpaca_2k_test
-    type: alpaca
+  - ds_type: json
+    data_files:
+      - mlabonne/orpo-dpo-mix-40k
+    split: train
+    type: llama3.argilla_chat
+
 dataset_prepared_path:
-val_set_size: 0.05
-output_dir: ./lora-out
+val_set_size: 0
+output_dir: ./qlora-out
+
+adapter: qlora
+lora_model_dir:
 
 sequence_len: 4096
-sample_packing: true
+sample_packing: false
 pad_to_sequence_len: true
 
-adapter: lora
-lora_model_dir:
 lora_r: 32
 lora_alpha: 16
 lora_dropout: 0.05
+lora_target_modules:
 lora_target_linear: true
 lora_fan_in_fan_out:
 
@@ -34,7 +44,7 @@ wandb_log_model:
 gradient_accumulation_steps: 4
 micro_batch_size: 2
 num_epochs: 4
-optimizer: adamw_bnb_8bit
+optimizer: paged_adamw_32bit
 lr_scheduler: cosine
 learning_rate: 0.0002
 
@@ -51,18 +61,13 @@ local_rank:
 logging_steps: 1
 xformers_attention:
 flash_attention: true
-s2_attention:
 
 warmup_steps: 10
 evals_per_epoch: 4
 eval_table_size:
-eval_max_new_tokens: 128
 saves_per_epoch: 1
 debug:
 deepspeed:
 weight_decay: 0.0
 fsdp:
 fsdp_config:
-special_tokens:
-  eos_token: "<|eot_id|>"
-  pad_token: "<|end_of_text|>"

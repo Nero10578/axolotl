@@ -320,8 +320,8 @@ def _load_raw_datasets(
     LOG.info("Loading raw datasets...", main_process_only=False)
     if not cfg.is_preprocess and not cfg.skip_prepare_dataset:
         LOG.warning(
-            "Processing datasets during training can lead to VRAM instability. Please "
-            "pre-process your dataset using `axolotl preprocess path/to/config.yml`."
+            "Processing datasets during training can lead to VRAM instability. Please"
+            " pre-process your dataset using `axolotl preprocess path/to/config.yml`."
         )
 
     # Load and process individual datasets

@@ -173,7 +173,6 @@ class AxolotlInputConfig(
             "description": "Whether to perform weighting in DPO trainer"
         },
     )
-    dpo_use_logits_to_keep: bool | None = None
     dpo_label_smoothing: float | None = None
     dpo_norm_loss: bool | None = None
 
@@ -183,7 +182,6 @@ class AxolotlInputConfig(
     )
 
     dpo_padding_free: bool | None = None
-    dpo_generate_during_eval: bool | None = None
 
     datasets: (
         Annotated[
@@ -1304,6 +1302,11 @@ class AxolotlConfigWCapabilities(AxolotlInputConfig):
     @classmethod
     def check_quantize_moe_experts(cls, data):
         if data.get("quantize_moe_experts"):
+            if data.get("lora_target_linear"):
+                raise ValueError(
+                    "lora_target_linear is not compatible with quantize_moe_experts. "
+                    "Use lora_target_parameters to target expert weights instead."
+                )
             if data.get("adapter") not in ("lora", "qlora"):
                 raise ValueError("quantize_moe_experts requires adapter: lora or qlora")
             if not (data.get("load_in_4bit") or data.get("load_in_8bit")):

@@ -166,6 +166,13 @@ class PatchManager:
 
     def _apply_fsdp_patches(self):
         """Apply patches for FSDP configurations."""
+        if self.cfg.fsdp_config:
+            from axolotl.monkeypatch.accelerate.fsdp2 import (
+                patch_initialize_missing_keys_for_fsdp,
+            )
+
+            patch_initialize_missing_keys_for_fsdp()
+
         if self.cfg.context_parallel_size > 1 or (
             self.cfg.fsdp_config and str(self.cfg.fsdp_version) == "2"
         ):
@@ -238,6 +245,31 @@ class PatchManager:
             )
 
             patch_qwen3_next_modeling_packing()
+
+        if self.cfg.model_config_type == "qwen3_5" and self.cfg.sample_packing:
+            from axolotl.monkeypatch.models.qwen3_5.modeling import (
+                patch_qwen3_5_modeling_packing,
+            )
+
+            patch_qwen3_5_modeling_packing()
+
+        if self.cfg.model_config_type == "qwen3_5_moe" and self.cfg.sample_packing:
+            from axolotl.monkeypatch.models.qwen3_5.modeling import (
+                patch_qwen3_5_moe_modeling_packing,
+            )
+
+            patch_qwen3_5_moe_modeling_packing()
+
+        if (
+            self.cfg.model_config_type in ["qwen3_5", "qwen3_5_moe"]
+            and self.cfg.is_multimodal
+            and self.cfg.flash_attention
+        ):
+            from axolotl.monkeypatch.models.qwen3_5.modeling import (
+                patch_qwen3_5_vlm_flash_attention,
+            )
+
+            patch_qwen3_5_vlm_flash_attention()
 
         if self.cfg.model_config_type == "kimi_linear":
             from axolotl.monkeypatch.models.kimi_linear.patch_kimi_linear import (

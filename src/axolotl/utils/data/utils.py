@@ -19,6 +19,14 @@ from axolotl.utils.trainer import filter_sequences_by_length
 
 LOG = get_logger(__name__)
 
+# Import work queue functions if available
+try:
+    from axolotl.datasets_work_queue import filter_with_work_queue
+    HAS_WORK_QUEUE = True
+except ImportError:
+    HAS_WORK_QUEUE = False
+    LOG.debug("Work queue not available, using standard dataset.filter()")
+
 
 class RetryStrategy(Enum):
     """Enum for retry strategies."""
@@ -232,12 +240,30 @@ def _filter_short_sequences(
     if filter_kwargs:
         desc_kwargs["desc"] = f"Filtering Short Sequences (<{min_len})"
 
-    dataset = dataset.filter(
-        functools.partial(keep_min_len, min_sequence_len=min_len),
-        batched=True,
-        **filter_kwargs,
-        **desc_kwargs,
+    # Use work queue if available and num_proc > 1
+    use_work_queue = (
+        HAS_WORK_QUEUE
+        and filter_kwargs.get("num_proc", 1) > 1
+        and not isinstance(dataset, IterableDataset)
     )
+
+    if use_work_queue:
+        LOG.info(f"Using work queue for filtering with {filter_kwargs['num_proc']} processes")
+        dataset = filter_with_work_queue(
+            dataset,
+            functools.partial(keep_min_len, min_sequence_len=min_len),
+            process_count=filter_kwargs["num_proc"],
+            batched=True,
+            batch_size=1000,
+            desc=desc_kwargs.get("desc", "Filtering"),
+        )
+    else:
+        dataset = dataset.filter(
+            functools.partial(keep_min_len, min_sequence_len=min_len),
+            batched=True,
+            **filter_kwargs,
+            **desc_kwargs,
+        )
 
     dropped = 0
     if prior_len:
@@ -287,17 +313,40 @@ def _drop_outside_range(
         )
         desc_kwargs["desc"] = f"{action} (<{min_len} or >{max_len})"
 
-    dataset = dataset.filter(
-        functools.partial(
-            filter_sequences_by_length,
-            sequence_len=max_len,
-            min_sequence_len=min_len,
-            raise_on_drop=raise_on_long,
-        ),
-        batched=True,
-        **filter_kwargs,
-        **desc_kwargs,
+    # Use work queue if available and num_proc > 1
+    use_work_queue = (
+        HAS_WORK_QUEUE
+        and filter_kwargs.get("num_proc", 1) > 1
+        and not isinstance(dataset, IterableDataset)
     )
+
+    if use_work_queue:
+        LOG.info(f"Using work queue for filtering with {filter_kwargs['num_proc']} processes")
+        dataset = filter_with_work_queue(
+            dataset,
+            functools.partial(
+                filter_sequences_by_length,
+                sequence_len=max_len,
+                min_sequence_len=min_len,
+                raise_on_drop=raise_on_long,
+            ),
+            process_count=filter_kwargs["num_proc"],
+            batched=True,
+            batch_size=1000,
+            desc=desc_kwargs.get("desc", "Filtering"),
+        )
+    else:
+        dataset = dataset.filter(
+            functools.partial(
+                filter_sequences_by_length,
+                sequence_len=max_len,
+                min_sequence_len=min_len,
+                raise_on_drop=raise_on_long,
+            ),
+            batched=True,
+            **filter_kwargs,
+            **desc_kwargs,
+        )
 
     dropped = 0
     if not raise_on_long and prior_len:

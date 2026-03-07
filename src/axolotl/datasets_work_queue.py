@@ -380,3 +380,542 @@ def wrap_multiple_datasets_for_work_queue_tokenized_prompt(
         processed_datasets.append(processed_dataset)
 
     return processed_datasets
+
+
+def filter_with_work_queue(
+    dataset: Dataset,
+    filter_fn,
+    process_count: int | None = None,
+    batched: bool = False,
+    batch_size: int = 1000,
+    desc: str = "Filtering",
+) -> Dataset:
+    """Filter dataset using work queue system instead of dataset.filter().
+
+    This implementation:
+    1. Creates a shared work queue with individual examples (or batches)
+    2. Worker processes pull examples as they finish their current work
+    3. No pre-allocation of work
+    4. Processes results in order they complete
+
+    Args:
+        dataset: Dataset to filter
+        filter_fn: Function that returns True to keep example, False to drop
+        process_count: Number of worker processes
+        batched: Whether to process batches (for batched filter functions)
+        batch_size: Batch size if batched=True
+        desc: Description for progress bar
+
+    Returns:
+        Filtered dataset
+    """
+    process_count = process_count or mp.cpu_count()
+    total_examples = len(dataset)
+    LOG.info(f"Filtering {total_examples} examples with work queue system")
+    LOG.info(f"Using {process_count} worker processes")
+
+    if batched:
+        # Convert to batches
+        examples = list(dataset)
+        batches = []
+        for i in range(0, len(examples), batch_size):
+            batch = examples[i:i + batch_size]
+            batches.append((i // batch_size, batch))
+        total_batches = len(batches)
+
+        # Create shared queues
+        work_queue = mp.Queue()
+        result_queue = mp.Queue()
+
+        # Add all batches to work queue
+        for batch_idx, batch in batches:
+            work_queue.put((batch_idx, batch))
+
+        # Worker function for batched filtering
+        def worker(worker_id):
+            """Worker process that continuously pulls from work queue."""
+            try:
+                while True:
+                    try:
+                        # Get work with timeout
+                        batch_idx, batch = work_queue.get(timeout=1)
+
+                        # Filter the batch
+                        try:
+                            # Call filter_fn with batch
+                            keep_mask = filter_fn(batch)
+
+                            # Filter batch based on mask
+                            if isinstance(keep_mask, list):
+                                filtered_batch = [item for item, keep in zip(batch, keep_mask) if keep]
+                            else:
+                                filtered_batch = batch if keep_mask else []
+
+                            result_queue.put((batch_idx, filtered_batch, None))
+                        except Exception as e:
+                            LOG.error(f"Worker {worker_id}: Error filtering batch {batch_idx}: {e}")
+                            result_queue.put((batch_idx, [], str(e)))
+                    except Exception:
+                        # queue.Empty or any other exception - no more work
+                        break
+            except Exception as e:
+                LOG.error(f"Worker {worker_id} crashed: {e}")
+
+        # Start worker processes
+        processes = []
+        for i in range(process_count):
+            p = mp.Process(target=worker, args=(i,))
+            p.daemon = True
+            p.start()
+            processes.append(p)
+
+        # Collect results with progress tracking
+        results = [None] * total_batches
+        completed = 0
+        errors = []
+
+        # Progress bar
+        pbar = tqdm(
+            total=total_batches,
+            desc=desc,
+            unit="batches",
+            file=sys.stdout,
+            ncols=100,
+        )
+
+        start_time = time.time()
+        last_update = start_time
+
+        while completed < total_batches:
+            try:
+                # Get result with timeout
+                batch_idx, filtered_batch, error = result_queue.get(timeout=10)
+
+                if error:
+                    errors.append(f"Batch {batch_idx}: {error}")
+                    results[batch_idx] = []
+                else:
+                    results[batch_idx] = filtered_batch
+
+                completed += 1
+                pbar.update(1)
+
+                # Update rate every second
+                current_time = time.time()
+                if current_time - last_update > 1:
+                    elapsed = current_time - start_time
+                    rate = completed / elapsed if elapsed > 0 else 0
+                    pbar.set_postfix({"batches/s": f"{rate:.1f}"})
+                    last_update = current_time
+            except queue.Empty:
+                LOG.error("Timeout waiting for results")
+                break
+
+        pbar.close()
+
+        # Wait for all processes to finish
+        for p in processes:
+            p.join(timeout=5)
+            if p.is_alive():
+                p.terminate()
+
+        # Report errors
+        if errors:
+            LOG.warning(f"Completed with {len(errors)} errors:")
+            for error in errors[:5]:
+                LOG.warning(f"  {error}")
+            if len(errors) > 5:
+                LOG.warning(f"  ... and {len(errors) - 5} more errors")
+
+        # Combine results in order
+        combined_examples = []
+        for batch in results:
+            if batch:
+                combined_examples.extend(batch)
+
+        # Create dataset from combined examples
+        if combined_examples:
+            return Dataset.from_list(combined_examples)
+        else:
+            # Return empty dataset with same features
+            return Dataset.from_dict({k: [] for k in dataset.features.keys()})
+
+    else:
+        # Non-batched filtering (single examples)
+        examples = list(dataset)
+
+        # Create shared queues
+        work_queue = mp.Queue()
+        result_queue = mp.Queue()
+
+        # Add all examples to work queue
+        for idx, example in enumerate(examples):
+            work_queue.put((idx, example))
+
+        # Worker function for single-example filtering
+        def worker(worker_id):
+            """Worker process that continuously pulls from work queue."""
+            try:
+                while True:
+                    try:
+                        # Get work with timeout
+                        idx, example = work_queue.get(timeout=1)
+
+                        # Filter the example
+                        try:
+                            keep = filter_fn(example)
+                            result_queue.put((idx, example if keep else None, None))
+                        except Exception as e:
+                            LOG.error(f"Worker {worker_id}: Error filtering example {idx}: {e}")
+                            result_queue.put((idx, None, str(e)))
+                    except Exception:
+                        # queue.Empty or any other exception - no more work
+                        break
+            except Exception as e:
+                LOG.error(f"Worker {worker_id} crashed: {e}")
+
+        # Start worker processes
+        processes = []
+        for i in range(process_count):
+            p = mp.Process(target=worker, args=(i,))
+            p.daemon = True
+            p.start()
+            processes.append(p)
+
+        # Collect results with progress tracking
+        results = [None] * total_examples
+        completed = 0
+        errors = []
+
+        # Progress bar
+        pbar = tqdm(
+            total=total_examples,
+            desc=desc,
+            unit="examples",
+            file=sys.stdout,
+            ncols=100,
+        )
+
+        start_time = time.time()
+        last_update = start_time
+
+        while completed < total_examples:
+            try:
+                # Get result with timeout
+                idx, example, error = result_queue.get(timeout=10)
+
+                if error:
+                    errors.append(f"Example {idx}: {error}")
+                    results[idx] = None
+                else:
+                    results[idx] = example
+
+                completed += 1
+                pbar.update(1)
+
+                # Update rate every second
+                current_time = time.time()
+                if current_time - last_update > 1:
+                    elapsed = current_time - start_time
+                    rate = completed / elapsed if elapsed > 0 else 0
+                    pbar.set_postfix({"examples/s": f"{rate:.1f}"})
+                    last_update = current_time
+            except queue.Empty:
+                LOG.error("Timeout waiting for results")
+                break
+
+        pbar.close()
+
+        # Wait for all processes to finish
+        for p in processes:
+            p.join(timeout=5)
+            if p.is_alive():
+                p.terminate()
+
+        # Report errors
+        if errors:
+            LOG.warning(f"Completed with {len(errors)} errors:")
+            for error in errors[:5]:
+                LOG.warning(f"  {error}")
+            if len(errors) > 5:
+                LOG.warning(f"  ... and {len(errors) - 5} more errors")
+
+        # Combine results in order (filter out None values)
+        combined_examples = [example for example in results if example is not None]
+
+        # Create dataset from combined examples
+        if combined_examples:
+            return Dataset.from_list(combined_examples)
+        else:
+            # Return empty dataset with same features
+            return Dataset.from_dict({k: [] for k in dataset.features.keys()})
+
+
+def map_with_work_queue(
+    dataset: Dataset,
+    map_fn,
+    process_count: int | None = None,
+    batched: bool = False,
+    batch_size: int = 1000,
+    desc: str = "Mapping",
+    remove_columns: list[str] | None = None,
+) -> Dataset:
+    """Map dataset using work queue system instead of dataset.map().
+
+    This implementation:
+    1. Creates a shared work queue with individual examples (or batches)
+    2. Worker processes pull examples as they finish their current work
+    3. No pre-allocation of work
+    4. Processes results in order they complete
+
+    Args:
+        dataset: Dataset to map
+        map_fn: Function to apply to each example/batch
+        process_count: Number of worker processes
+        batched: Whether to process batches (for batched map functions)
+        batch_size: Batch size if batched=True
+        desc: Description for progress bar
+        remove_columns: Columns to remove after mapping
+
+    Returns:
+        Mapped dataset
+    """
+    process_count = process_count or mp.cpu_count()
+    total_examples = len(dataset)
+    LOG.info(f"Mapping {total_examples} examples with work queue system")
+    LOG.info(f"Using {process_count} worker processes")
+
+    if batched:
+        # Convert to batches
+        examples = list(dataset)
+        batches = []
+        for i in range(0, len(examples), batch_size):
+            batch = examples[i:i + batch_size]
+            batches.append((i // batch_size, batch))
+        total_batches = len(batches)
+
+        # Create shared queues
+        work_queue = mp.Queue()
+        result_queue = mp.Queue()
+
+        # Add all batches to work queue
+        for batch_idx, batch in batches:
+            work_queue.put((batch_idx, batch))
+
+        # Worker function for batched mapping
+        def worker(worker_id):
+            """Worker process that continuously pulls from work queue."""
+            try:
+                while True:
+                    try:
+                        # Get work with timeout
+                        batch_idx, batch = work_queue.get(timeout=1)
+
+                        # Map the batch
+                        try:
+                            mapped_batch = map_fn(batch)
+                            result_queue.put((batch_idx, mapped_batch, None))
+                        except Exception as e:
+                            LOG.error(f"Worker {worker_id}: Error mapping batch {batch_idx}: {e}")
+                            result_queue.put((batch_idx, None, str(e)))
+                    except Exception:
+                        # queue.Empty or any other exception - no more work
+                        break
+            except Exception as e:
+                LOG.error(f"Worker {worker_id} crashed: {e}")
+
+        # Start worker processes
+        processes = []
+        for i in range(process_count):
+            p = mp.Process(target=worker, args=(i,))
+            p.daemon = True
+            p.start()
+            processes.append(p)
+
+        # Collect results with progress tracking
+        results = [None] * total_batches
+        completed = 0
+        errors = []
+
+        # Progress bar
+        pbar = tqdm(
+            total=total_batches,
+            desc=desc,
+            unit="batches",
+            file=sys.stdout,
+            ncols=100,
+        )
+
+        start_time = time.time()
+        last_update = start_time
+
+        while completed < total_batches:
+            try:
+                # Get result with timeout
+                batch_idx, mapped_batch, error = result_queue.get(timeout=10)
+
+                if error:
+                    errors.append(f"Batch {batch_idx}: {error}")
+                    results[batch_idx] = None
+                else:
+                    results[batch_idx] = mapped_batch
+
+                completed += 1
+                pbar.update(1)
+
+                # Update rate every second
+                current_time = time.time()
+                if current_time - last_update > 1:
+                    elapsed = current_time - start_time
+                    rate = completed / elapsed if elapsed > 0 else 0
+                    pbar.set_postfix({"batches/s": f"{rate:.1f}"})
+                    last_update = current_time
+            except queue.Empty:
+                LOG.error("Timeout waiting for results")
+                break
+
+        pbar.close()
+
+        # Wait for all processes to finish
+        for p in processes:
+            p.join(timeout=5)
+            if p.is_alive():
+                p.terminate()
+
+        # Report errors
+        if errors:
+            LOG.warning(f"Completed with {len(errors)} errors:")
+            for error in errors[:5]:
+                LOG.warning(f"  {error}")
+            if len(errors) > 5:
+                LOG.warning(f"  ... and {len(errors) - 5} more errors")
+
+        # Combine results in order
+        combined_results = {}
+        for batch in results:
+            if batch:
+                for key, value in batch.items():
+                    if key not in combined_results:
+                        combined_results[key] = []
+                    combined_results[key].extend(value)
+
+        # Create dataset from combined results
+        return Dataset.from_dict(combined_results)
+
+    else:
+        # Non-batched mapping (single examples)
+        examples = list(dataset)
+
+        # Create shared queues
+        work_queue = mp.Queue()
+        result_queue = mp.Queue()
+
+        # Add all examples to work queue
+        for idx, example in enumerate(examples):
+            work_queue.put((idx, example))
+
+        # Worker function for single-example mapping
+        def worker(worker_id):
+            """Worker process that continuously pulls from work queue."""
+            try:
+                while True:
+                    try:
+                        # Get work with timeout
+                        idx, example = work_queue.get(timeout=1)
+
+                        # Map the example
+                        try:
+                            mapped_example = map_fn(example)
+                            result_queue.put((idx, mapped_example, None))
+                        except Exception as e:
+                            LOG.error(f"Worker {worker_id}: Error mapping example {idx}: {e}")
+                            result_queue.put((idx, None, str(e)))
+                    except Exception:
+                        # queue.Empty or any other exception - no more work
+                        break
+            except Exception as e:
+                LOG.error(f"Worker {worker_id} crashed: {e}")
+
+        # Start worker processes
+        processes = []
+        for i in range(process_count):
+            p = mp.Process(target=worker, args=(i,))
+            p.daemon = True
+            p.start()
+            processes.append(p)
+
+        # Collect results with progress tracking
+        results = [None] * total_examples
+        completed = 0
+        errors = []
+
+        # Progress bar
+        pbar = tqdm(
+            total=total_examples,
+            desc=desc,
+            unit="examples",
+            file=sys.stdout,
+            ncols=100,
+        )
+
+        start_time = time.time()
+        last_update = start_time
+
+        while completed < total_examples:
+            try:
+                # Get result with timeout
+                idx, mapped_example, error = result_queue.get(timeout=10)
+
+                if error:
+                    errors.append(f"Example {idx}: {error}")
+                    results[idx] = None
+                else:
+                    results[idx] = mapped_example
+
+                completed += 1
+                pbar.update(1)
+
+                # Update rate every second
+                current_time = time.time()
+                if current_time - last_update > 1:
+                    elapsed = current_time - start_time
+                    rate = completed / elapsed if elapsed > 0 else 0
+                    pbar.set_postfix({"examples/s": f"{rate:.1f}"})
+                    last_update = current_time
+            except queue.Empty:
+                LOG.error("Timeout waiting for results")
+                break
+
+        pbar.close()
+
+        # Wait for all processes to finish
+        for p in processes:
+            p.join(timeout=5)
+            if p.is_alive():
+                p.terminate()
+
+        # Report errors
+        if errors:
+            LOG.warning(f"Completed with {len(errors)} errors:")
+            for error in errors[:5]:
+                LOG.warning(f"  {error}")
+            if len(errors) > 5:
+                LOG.warning(f"  ... and {len(errors) - 5} more errors")
+
+        # Combine results in order
+        combined_results = {}
+        for result in results:
+            if result:
+                for key, value in result.items():
+                    if key not in combined_results:
+                        combined_results[key] = []
+                    combined_results[key].append(value)
+
+        # Remove columns if specified
+        if remove_columns:
+            for col in remove_columns:
+                if col in combined_results:
+                    del combined_results[col]
+
+        # Create dataset from combined results
+        return Dataset.from_dict(combined_results)

@@ -24,6 +24,14 @@ from axolotl.utils.samplers import MultipackBatchSampler, get_dataset_lengths
 
 LOG = get_logger(__name__)
 
+# Import work queue functions if available
+try:
+    from axolotl.datasets_work_queue import map_with_work_queue, filter_with_work_queue
+    HAS_WORK_QUEUE = True
+except ImportError:
+    HAS_WORK_QUEUE = False
+    LOG.debug("Work queue not available, using standard dataset.map()")
+
 
 @torch.jit.script
 def weighted_cross_entropy(
@@ -295,15 +303,36 @@ def process_datasets_for_packing(cfg, train_dataset, eval_dataset):
         filter_map_kwargs["num_proc"] = cfg.dataset_num_proc
         filter_map_kwargs["load_from_cache_file"] = not cfg.is_preprocess
 
+    # Check if we should use work queue
+    use_work_queue = (
+        HAS_WORK_QUEUE
+        and filter_map_kwargs.get("num_proc", 1) > 1
+        and not isinstance(train_dataset, IterableDataset)
+    )
+
     drop_long_kwargs = {}
     if filter_map_kwargs:
         drop_long_kwargs["desc"] = "Drop Samples with Zero Trainable Tokens"
-    train_dataset = train_dataset.filter(
-        drop_no_trainable_tokens,
-        batched=True,
-        **filter_map_kwargs,
-        **drop_long_kwargs,
-    )
+
+    # Use work queue for filtering if available
+    if use_work_queue:
+        LOG.info(f"Using work queue for filtering with {filter_map_kwargs['num_proc']} processes")
+        train_dataset = filter_with_work_queue(
+            train_dataset,
+            drop_no_trainable_tokens,
+            process_count=filter_map_kwargs["num_proc"],
+            batched=True,
+            batch_size=1000,
+            desc=drop_long_kwargs.get("desc", "Filtering"),
+        )
+    else:
+        train_dataset = train_dataset.filter(
+            drop_no_trainable_tokens,
+            batched=True,
+            **filter_map_kwargs,
+            **drop_long_kwargs,
+        )
+
     if prior_len:
         dropped = prior_len - len(train_dataset)
         if dropped:
@@ -317,11 +346,24 @@ def process_datasets_for_packing(cfg, train_dataset, eval_dataset):
         except TypeError:
             # handle iterable datasets case
             prior_len = None
-        eval_dataset = eval_dataset.filter(
-            drop_no_trainable_tokens,
-            **filter_map_kwargs,
-            **drop_long_kwargs,
-        )
+
+        # Use work queue for filtering if available
+        if use_work_queue:
+            eval_dataset = filter_with_work_queue(
+                eval_dataset,
+                drop_no_trainable_tokens,
+                process_count=filter_map_kwargs["num_proc"],
+                batched=True,
+                batch_size=1000,
+                desc=drop_long_kwargs.get("desc", "Filtering"),
+            )
+        else:
+            eval_dataset = eval_dataset.filter(
+                drop_no_trainable_tokens,
+                **filter_map_kwargs,
+                **drop_long_kwargs,
+            )
+
         if prior_len:
             dropped = prior_len - len(eval_dataset)
             if dropped:
@@ -330,12 +372,24 @@ def process_datasets_for_packing(cfg, train_dataset, eval_dataset):
                 )
 
     if cfg.group_by_length:
-        train_dataset = train_dataset.map(
-            add_length,
-            num_proc=cfg.dataset_num_proc,
-            load_from_cache_file=not cfg.is_preprocess,
-            desc="Group By Length",
-        )
+        # Use work queue for mapping if available
+        if use_work_queue:
+            LOG.info(f"Using work queue for mapping with {filter_map_kwargs['num_proc']} processes")
+            train_dataset = map_with_work_queue(
+                train_dataset,
+                add_length,
+                process_count=filter_map_kwargs["num_proc"],
+                batched=True,
+                batch_size=1000,
+                desc="Group By Length",
+            )
+        else:
+            train_dataset = train_dataset.map(
+                add_length,
+                num_proc=cfg.dataset_num_proc,
+                load_from_cache_file=not cfg.is_preprocess,
+                desc="Group By Length",
+            )
 
     if cfg.use_pose:
         pose_kwargs = {}
@@ -347,38 +401,86 @@ def process_datasets_for_packing(cfg, train_dataset, eval_dataset):
             split_on_token_ids=cfg.pose_split_on_token_ids,
             **pose_kwargs,
         )
-        train_dataset = train_dataset.map(
-            pose_fn,
-            num_proc=cfg.dataset_num_proc,
-            load_from_cache_file=not cfg.is_preprocess,
-            desc="Add position_id column (PoSE)",
-        )
+        # Use work queue for mapping if available
+        if use_work_queue:
+            LOG.info(f"Using work queue for mapping with {filter_map_kwargs['num_proc']} processes")
+            train_dataset = map_with_work_queue(
+                train_dataset,
+                pose_fn,
+                process_count=filter_map_kwargs["num_proc"],
+                batched=True,
+                batch_size=1000,
+                desc="Add position_id column (PoSE)",
+            )
+        else:
+            train_dataset = train_dataset.map(
+                pose_fn,
+                num_proc=cfg.dataset_num_proc,
+                load_from_cache_file=not cfg.is_preprocess,
+                desc="Add position_id column (PoSE)",
+            )
         train_dataset = train_dataset.sort("sequence_len")
         if cfg.eval_sample_packing is not False:
             if eval_dataset:
-                eval_dataset = eval_dataset.map(
-                    pose_fn,
-                    num_proc=cfg.dataset_num_proc,
-                    load_from_cache_file=not cfg.is_preprocess,
-                    desc="Add position_id column (PoSE)",
-                )
+                # Use work queue for mapping if available
+                if use_work_queue:
+                    eval_dataset = map_with_work_queue(
+                        eval_dataset,
+                        pose_fn,
+                        process_count=filter_map_kwargs["num_proc"],
+                        batched=True,
+                        batch_size=1000,
+                        desc="Add position_id column (PoSE)",
+                    )
+                else:
+                    eval_dataset = eval_dataset.map(
+                        pose_fn,
+                        num_proc=cfg.dataset_num_proc,
+                        load_from_cache_file=not cfg.is_preprocess,
+                        desc="Add position_id column (PoSE)",
+                    )
     elif cfg.sample_packing:
         drop_long_kwargs = {}
         if filter_map_kwargs:
             drop_long_kwargs["desc"] = "Add position_id column (Sample Packing)"
-        train_dataset = train_dataset.map(
-            add_position_ids,
-            batched=True,
-            **filter_map_kwargs,
-            **drop_long_kwargs,
-        )
+
+        # Use work queue for mapping if available
+        if use_work_queue:
+            LOG.info(f"Using work queue for mapping with {filter_map_kwargs['num_proc']} processes")
+            train_dataset = map_with_work_queue(
+                train_dataset,
+                add_position_ids,
+                process_count=filter_map_kwargs["num_proc"],
+                batched=True,
+                batch_size=1000,
+                desc=drop_long_kwargs.get("desc", "Mapping"),
+            )
+        else:
+            train_dataset = train_dataset.map(
+                add_position_ids,
+                batched=True,
+                **filter_map_kwargs,
+                **drop_long_kwargs,
+            )
+
         if cfg.eval_sample_packing:
             if eval_dataset:
-                eval_dataset = eval_dataset.map(
-                    add_position_ids,
-                    **filter_map_kwargs,
-                    **drop_long_kwargs,
-                )
+                # Use work queue for mapping if available
+                if use_work_queue:
+                    eval_dataset = map_with_work_queue(
+                        eval_dataset,
+                        add_position_ids,
+                        process_count=filter_map_kwargs["num_proc"],
+                        batched=True,
+                        batch_size=1000,
+                        desc=drop_long_kwargs.get("desc", "Mapping"),
+                    )
+                else:
+                    eval_dataset = eval_dataset.map(
+                        add_position_ids,
+                        **filter_map_kwargs,
+                        **drop_long_kwargs,
+                    )
 
     return train_dataset, eval_dataset
 

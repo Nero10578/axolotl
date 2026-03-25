@@ -22,6 +22,7 @@ from axolotl.utils.schemas.datasets import (
     PretrainingDataset,
     SFTDataset,
     StepwiseSupervisedDataset,
+    SyntheticDataset,
 )
 from axolotl.utils.schemas.deprecated import DeprecatedParameters, RemappedParameters
 from axolotl.utils.schemas.dynamic_checkpoint import DynamicCheckpointConfig
@@ -52,6 +53,119 @@ from axolotl.utils.schemas.validation import ValidationMixin
 from axolotl.utils.schemas.vllm import VllmConfig
 
 LOG = get_logger(__name__)
+
+
+class EBFTConfig(BaseModel):
+    """Configuration for Energy-Based Fine-Tuning (EBFT)"""
+
+    feature_layers: list[float] = Field(
+        default=[0.25, 0.5, 0.75],
+        json_schema_extra={
+            "description": "Fractional layer depths for feature extraction (e.g., [0.25, 0.5, 0.75])"
+        },
+    )
+    embed_method: Literal["last_token", "mean_pooling", "completion_mean", "concat"] = (
+        Field(
+            default="last_token",
+            json_schema_extra={
+                "description": "Embedding method: 'last_token', 'mean_pooling', 'completion_mean', or 'concat'"
+            },
+        )
+    )
+    use_whitening: bool = Field(
+        default=False,
+        json_schema_extra={"description": "Apply SVD whitening to feature embeddings"},
+    )
+    alignment_coef: float = Field(
+        default=1.0,
+        json_schema_extra={
+            "description": "Coefficient for alignment reward (cosine similarity with ground truth)"
+        },
+    )
+    diversity_coef: float = Field(
+        default=1.0,
+        json_schema_extra={
+            "description": "Coefficient for diversity penalty (pairwise similarity between samples)"
+        },
+    )
+    ce_coef: float = Field(
+        default=0.0,
+        json_schema_extra={
+            "description": "Cross-entropy loss coefficient on ground-truth tokens"
+        },
+    )
+    adaptive_max_tokens: bool = Field(
+        default=True,
+        json_schema_extra={
+            "description": "Set per-batch max_tokens based on ground-truth length"
+        },
+    )
+    gt_length_multiplier: float = Field(
+        default=1.5,
+        ge=0.1,
+        json_schema_extra={
+            "description": "Multiplier for ground-truth token count when computing adaptive max_tokens"
+        },
+    )
+
+    # Strided mode fields (for unstructured text)
+    mode: Literal["structured", "strided"] = Field(
+        default="structured",
+        json_schema_extra={
+            "description": "EBFT mode: 'structured' (QA with vLLM) or 'strided' (unstructured text)"
+        },
+    )
+    stride: int = Field(
+        default=8,
+        ge=1,
+        json_schema_extra={"description": "Stride between anchor points (tokens)"},
+    )
+    context_length: int = Field(
+        default=8,
+        ge=1,
+        json_schema_extra={"description": "Context window size per block"},
+    )
+    generate_max_len: int = Field(
+        default=8,
+        ge=1,
+        json_schema_extra={"description": "Tokens to generate per block"},
+    )
+    n_samples_per_prompt: int = Field(
+        default=4,
+        ge=1,
+        json_schema_extra={"description": "Independent rollouts per document"},
+    )
+    temperature: float = Field(
+        default=0.6,
+        ge=0.0,
+        json_schema_extra={
+            "description": "Sampling temperature for strided generation"
+        },
+    )
+    top_p: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        json_schema_extra={"description": "Top-p nucleus sampling threshold"},
+    )
+    rl_coef: float = Field(
+        default=1.0,
+        json_schema_extra={"description": "RL policy gradient loss coefficient"},
+    )
+    advantage_estimator: Literal["rloo", "group_norm", "reinforce"] = Field(
+        default="rloo",
+        json_schema_extra={
+            "description": "Advantage estimator: 'rloo', 'group_norm', 'reinforce'"
+        },
+    )
+    min_completion_prefix: int = Field(
+        default=0,
+        ge=0,
+        json_schema_extra={
+            "description": "Minimum tokens into completion before placing anchors. "
+            "Skips anchors too close to the prompt boundary where features are dominated by prompt context."
+        },
+    )
 
 
 class AxolotlInputConfig(
@@ -130,7 +244,7 @@ class AxolotlInputConfig(
     rl: RLType | None = Field(
         default=None,
         json_schema_extra={
-            "description": "Use RL training: 'dpo', 'ipo', 'kto', 'simpo', 'orpo', 'grpo'"
+            "description": "Use RL training: 'dpo', 'ipo', 'kto', 'simpo', 'orpo', 'grpo', 'ebft'"
         },
     )
     trl: TRLConfig | None = Field(
@@ -138,6 +252,12 @@ class AxolotlInputConfig(
     )
     vllm: VllmConfig | None = Field(
         default_factory=lambda: VllmConfig(),
+    )
+    ebft: EBFTConfig | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Configuration for Energy-Based Fine-Tuning (EBFT)"
+        },
     )
     qat: QATConfig | None = None
     quantization: PTQConfig | None = None
@@ -185,7 +305,13 @@ class AxolotlInputConfig(
 
     datasets: (
         Annotated[
-            list[SFTDataset | DPODataset | KTODataset | StepwiseSupervisedDataset],
+            list[
+                SFTDataset
+                | DPODataset
+                | KTODataset
+                | StepwiseSupervisedDataset
+                | SyntheticDataset
+            ],
             MinLen(1),
         ]
         | None
@@ -198,7 +324,13 @@ class AxolotlInputConfig(
 
     test_datasets: (
         Annotated[
-            list[SFTDataset | DPODataset | KTODataset | StepwiseSupervisedDataset],
+            list[
+                SFTDataset
+                | DPODataset
+                | KTODataset
+                | StepwiseSupervisedDataset
+                | SyntheticDataset
+            ],
             MinLen(1),
         ]
         | None
@@ -431,6 +563,12 @@ class AxolotlInputConfig(
         default=False,
         json_schema_extra={
             "description": "Whether to offload activations. Available options are: true, false, 'legacy', 'disk'."
+        },
+    )
+    layer_offloading: bool | None = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Offload model layer parameters to CPU during forward, prefetch back during backward."
         },
     )
 
@@ -682,6 +820,12 @@ class AxolotlInputConfig(
         default=None,
         json_schema_extra={
             "description": "Apply custom LoRA autograd functions and activation function Triton kernels for speed and memory savings. See: https://docs.axolotl.ai/docs/lora_optims.html"
+        },
+    )
+    lora_embedding_kernel: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Apply custom LoRA autograd function for embedding layers. See: https://docs.axolotl.ai/docs/lora_optims.html"
         },
     )
 
@@ -1294,6 +1438,7 @@ class AxolotlConfigWCapabilities(AxolotlInputConfig):
             data.get("lora_mlp_kernel")
             or data.get("lora_qkv_kernel")
             or data.get("lora_o_kernel")
+            or data.get("lora_embedding_kernel")
         ):
             capabilities = data.get("capabilities")
             is_fsdp = data.get("fsdp_config") is not None
@@ -1341,7 +1486,12 @@ class AxolotlConfigWCapabilities(AxolotlInputConfig):
         if data.get("adapter") in ["lora", "qlora"]:
             # Skip if already set, using unsloth optimizations, or using 8-bit
             unsloth_fields = ["unsloth_lora_mlp", "unsloth_lora_qkv", "unsloth_lora_o"]
-            kernel_fields = ["lora_mlp_kernel", "lora_qkv_kernel", "lora_o_kernel"]
+            kernel_fields = [
+                "lora_mlp_kernel",
+                "lora_qkv_kernel",
+                "lora_o_kernel",
+                "lora_embedding_kernel",
+            ]
             if (
                 any(data.get(k) is not None for k in kernel_fields)
                 or any(data.get(k) for k in unsloth_fields)
@@ -1354,9 +1504,38 @@ class AxolotlConfigWCapabilities(AxolotlInputConfig):
             if data.get("trust_remote_code"):
                 return data
 
-            # Skip if dropout is not 0, as auto enabling it would just disable it during runtime patch checks
-            if data.get("lora_dropout") != 0:
-                return data
+            # Skip auto-enable for MoE models when native grouped_mm is unavailable
+            # (torch < 2.9). The grouped_mm fallback in transformers uses torch.mm
+            # with out= which bypasses autocast and fails on mixed dtypes during eval.
+            env_capabilities = data.get("env_capabilities", {})
+            torch_version = env_capabilities.get("torch_version")
+            if torch_version is None:
+                import torch
+
+                torch_version = str(torch.__version__).split("+", maxsplit=1)[0]
+            has_grouped_mm = version.parse(torch_version) >= version.parse("2.9.0")
+            if not has_grouped_mm:
+                is_moe = False
+                model_type = data.get("model_config_type", "")
+                if model_type and "moe" in model_type.lower():
+                    is_moe = True
+                if not is_moe:
+                    try:
+                        from transformers import AutoConfig
+
+                        base_model = data.get("base_model")
+                        if base_model:
+                            auto_cfg = AutoConfig.from_pretrained(
+                                base_model, trust_remote_code=False
+                            )
+                            if getattr(auto_cfg, "num_local_experts", None) or getattr(
+                                auto_cfg, "num_experts", None
+                            ):
+                                is_moe = True
+                    except Exception:  # pylint: disable=broad-exception-caught
+                        pass
+                if is_moe:
+                    return data
 
             # Check multi-GPU compatibility
             capabilities = data.get("capabilities")
@@ -1378,6 +1557,9 @@ class AxolotlConfigWCapabilities(AxolotlInputConfig):
 
                 if data.get("lora_o_kernel") is None:
                     data["lora_o_kernel"] = True
+
+                if data.get("lora_embedding_kernel") is None:
+                    data["lora_embedding_kernel"] = True
 
                 LOG.warning(
                     "Auto-enabling LoRA kernel optimizations for faster training. "

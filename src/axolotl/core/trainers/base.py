@@ -29,10 +29,12 @@ from transformers.utils import SAFE_WEIGHTS_NAME, is_peft_available
 from trl.experimental.utils import pad_to_length
 from typing_extensions import override
 
+from axolotl.core.trainers.constants import TOKENS_STATE_FILE
 from axolotl.core.trainers.mixins import (
     ActivationOffloadingMixin,
     CheckpointSaveMixin,
     DistributedParallelMixin,
+    LayerOffloadingMixin,
     OptimizerMixin,
     PackingMixin,
     RngLoaderMixin,
@@ -51,8 +53,6 @@ from axolotl.utils.samplers import MultipackBatchSampler, get_dataset_lengths
 
 LOG = get_logger(__name__)
 
-TOKENS_STATE_FILE = "tokens_state."
-
 REDUCTION_FNS = {
     "mean": torch.mean,
     "min": torch.min,
@@ -67,6 +67,7 @@ class AxolotlTrainer(
     OptimizerMixin,
     RngLoaderMixin,
     CheckpointSaveMixin,
+    LayerOffloadingMixin,
     ActivationOffloadingMixin,
     DistributedParallelMixin,
     Trainer,

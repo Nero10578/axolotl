@@ -8,6 +8,7 @@ import os
 from functools import cached_property
 
 import addict
+import torch
 import transformers
 from transformers import PretrainedConfig, PreTrainedModel
 from transformers.modeling_flash_attention_utils import is_flash_attn_available
@@ -94,6 +95,7 @@ class PatchManager:
     def apply_pre_model_load_patches(self):
         """Apply pre-model load patches based on config."""
         self._deactivate_hf_async_load()
+        self._apply_torchao_patches()
         self._apply_transformers_patches()
         # self._apply_flex_attention_patches()
         self._apply_flash_attention_patches()
@@ -124,6 +126,12 @@ class PatchManager:
         self._apply_tiled_mlp(self.cfg.model_config_type)
         self._apply_moe_expert_quantization_patch()
 
+    @staticmethod
+    def _apply_torchao_patches():
+        from axolotl.monkeypatch.torchao_optim import patch_torchao_optim_state_8bit
+
+        patch_torchao_optim_state_8bit()
+
     def _apply_transformers_patches(self):
         from axolotl.monkeypatch.transformers.trainer_loss_calc import (
             patch_evaluation_loop,
@@ -142,6 +150,13 @@ class PatchManager:
 
     def apply_post_model_build_patches(self, model: PreTrainedModel):
         """Apply patches right after model build, before post-load setup."""
+        if self.cfg.model_config_type == "nemotron_h":
+            # Must run after model build because NemotronHForCausalLM.__init__
+            # calls register_nemotron_h_conversion_mapping() with overwrite=True,
+            # which would clobber any earlier fix.
+            self._fix_nemotron_h_conversion_mapping()
+
+        self._apply_gemma_hybrid_attention(model)
         self._finalize_moe_expert_quantization(model)
 
     def apply_post_model_load_patches(self, model: PreTrainedModel):
@@ -150,6 +165,72 @@ class PatchManager:
         self._apply_unsloth_patches(model)
         self._apply_lora_kernel_patch(model)
         self._apply_scaling_softmax_patch(model)
+
+    def _apply_gemma_hybrid_attention(self, model: PreTrainedModel):
+        """Apply hybrid attention: FA2 for sliding window layers, SDPA for global layers.
+
+        Gemma 4 has global (full_attention) layers with head_dim=512
+        which exceeds flash attention's supported size. This patch loads the model
+        with flash_attention_2 for the sliding window layers (head_dim=256), then
+        gives each global layer a shallow-copied config with _attn_implementation="sdpa".
+        """
+        if not self.cfg.gemma4_hybrid_attn_impl:
+            return
+
+        import copy
+
+        # Navigate to the module that has 'layers' - varies by model structure:
+        # Gemma4ForConditionalGeneration -> .model (Gemma4Model) -> .language_model (Gemma4TextModel) -> .layers
+        # Gemma4ForCausalLM -> .model (Gemma4TextModel) -> .layers
+        layers = None
+        config_source = None
+        for candidate in [model, getattr(model, "model", None)]:
+            if candidate is None:
+                continue
+            # Check direct layers
+            if hasattr(candidate, "layers"):
+                layers = candidate.layers
+                config_source = candidate
+                break
+            # Check language_model.layers (multimodal wrapper)
+            lang_model = getattr(candidate, "language_model", None)
+            if lang_model is not None and hasattr(lang_model, "layers"):
+                layers = lang_model.layers
+                config_source = lang_model
+                break
+
+        if layers is None:
+            LOG.warning(
+                "gemma4_hybrid_attn_impl: could not find decoder layers in model, skipping"
+            )
+            return
+
+        config = getattr(config_source, "config", self.model_config)
+        layer_types = getattr(config, "layer_types", None)
+        if layer_types is None:
+            LOG.warning(
+                "gemma4_hybrid_attn_impl: model config has no 'layer_types', skipping. "
+                "This feature requires a model with mixed sliding/global attention layers."
+            )
+            return
+
+        patched_count = 0
+        for layer_idx, layer in enumerate(layers):
+            if layer_types[layer_idx] != "sliding_attention":
+                # Global / full_attention layer - use SDPA instead of FA2
+                attn_module = getattr(layer, "self_attn", None)
+                if attn_module is not None and hasattr(attn_module, "config"):
+                    sdpa_config = copy.copy(attn_module.config)
+                    sdpa_config._attn_implementation = "sdpa"
+                    attn_module.config = sdpa_config
+                    patched_count += 1
+
+        LOG.info(
+            "gemma4_hybrid_attn_impl: patched %d global layers to use SDPA "
+            "(remaining %d sliding layers use flash_attention_2)",
+            patched_count,
+            len(layers) - patched_count,
+        )
 
     def _apply_flash_attention_patches(self):
         """Apply patches related to Flash Attention."""
@@ -252,44 +333,113 @@ class PatchManager:
 
             patch_llama4_linearized_modeling()
 
-        if self.cfg.model_config_type == "qwen3_next" and self.cfg.sample_packing:
-            from axolotl.monkeypatch.models.qwen3_next.modeling import (
-                patch_qwen3_next_modeling_packing,
-            )
-
-            patch_qwen3_next_modeling_packing()
-
-        if self.cfg.model_config_type == "qwen3_5" and self.cfg.sample_packing:
-            from axolotl.monkeypatch.models.qwen3_5.modeling import (
-                patch_qwen3_5_modeling_packing,
-            )
-
-            patch_qwen3_5_modeling_packing()
-
-        if self.cfg.model_config_type == "qwen3_5_moe" and self.cfg.sample_packing:
-            from axolotl.monkeypatch.models.qwen3_5.modeling import (
-                patch_qwen3_5_moe_modeling_packing,
-            )
-
-            patch_qwen3_5_moe_modeling_packing()
-
-        if (
-            self.cfg.model_config_type in ["qwen3_5", "qwen3_5_moe"]
-            and self.cfg.is_multimodal
-            and self.cfg.flash_attention
-        ):
-            from axolotl.monkeypatch.models.qwen3_5.modeling import (
-                patch_qwen3_5_vlm_flash_attention,
-            )
-
-            patch_qwen3_5_vlm_flash_attention()
-
         if self.cfg.model_config_type == "kimi_linear":
             from axolotl.monkeypatch.models.kimi_linear.patch_kimi_linear import (
                 patch_kimi_model,
             )
 
             patch_kimi_model()
+
+        if self.cfg.model_config_type == "nemotron_h":
+            if self.cfg.sample_packing:
+                from transformers.models.nemotron_h.modeling_nemotron_h import (
+                    NemotronHPreTrainedModel,
+                )
+
+                from axolotl.monkeypatch.models.nemotron_h.modeling import (
+                    patch_nemotron_h_modeling_packing,
+                )
+
+                patch_nemotron_h_modeling_packing()
+                # supports_gradient_checkpointing is only enabled after
+                # patch_nemotron_h_modeling_packing() installs the GC-compatible
+                # NemotronHBlock.forward. Without the patch, upstream marks this
+                # False because the original block forward is not GC-safe.
+                NemotronHPreTrainedModel.supports_gradient_checkpointing = True
+
+        # Patches requiring CUDA
+        if torch.cuda.is_available():
+            if self.cfg.model_config_type == "qwen3_next" and self.cfg.sample_packing:
+                from axolotl.monkeypatch.models.qwen3_next.modeling import (
+                    patch_qwen3_next_modeling_packing,
+                )
+
+                patch_qwen3_next_modeling_packing()
+
+            if self.cfg.model_config_type == "qwen3_5" and self.cfg.sample_packing:
+                from axolotl.monkeypatch.models.qwen3_5.modeling import (
+                    patch_qwen3_5_modeling_packing,
+                )
+
+                patch_qwen3_5_modeling_packing()
+
+            if self.cfg.model_config_type == "qwen3_5_moe" and self.cfg.sample_packing:
+                from axolotl.monkeypatch.models.qwen3_5.modeling import (
+                    patch_qwen3_5_moe_modeling_packing,
+                )
+
+                patch_qwen3_5_moe_modeling_packing()
+
+            if (
+                self.cfg.model_config_type in ["qwen3_5", "qwen3_5_moe"]
+                and self.cfg.is_multimodal
+                and self.cfg.flash_attention
+            ):
+                from axolotl.monkeypatch.models.qwen3_5.modeling import (
+                    patch_qwen3_5_vlm_flash_attention,
+                )
+
+                patch_qwen3_5_vlm_flash_attention()
+
+            if self.cfg.model_config_type in ("gemma4", "gemma4_text"):
+                from axolotl.monkeypatch.models.gemma4.fused_attn import (
+                    patch_gemma4_fused_attn,
+                )
+
+                patch_gemma4_fused_attn()
+
+    @staticmethod
+    def _fix_nemotron_h_conversion_mapping():
+        """Remove the spurious embedding→embeddings WeightRenaming from the
+        nemotron_h checkpoint conversion mapping.
+
+        The nvidia Hub model registers:
+            WeightRenaming("embedding.weight", "embeddings.weight")
+        to handle a legacy checkpoint variant. Its reverse (applied on save)
+        converts ``embeddings`` back to ``embedding``, which silently renames
+        ``backbone.embeddings.weight`` → ``backbone.embedding.weight`` when
+        merging LoRA adapters back into the base model.
+        """
+        try:
+            from transformers.conversion_mapping import (
+                WeightRenaming,
+                get_checkpoint_conversion_mapping,
+                register_checkpoint_conversion_mapping,
+            )
+        except ImportError:
+            return
+
+        mapping = get_checkpoint_conversion_mapping("nemotron_h")
+        if mapping is None:
+            return
+
+        filtered = [
+            entry
+            for entry in mapping
+            if not (
+                isinstance(entry, WeightRenaming)
+                and entry.source_patterns == ["embedding.weight"]
+                and entry.target_patterns == ["embeddings.weight"]
+            )
+        ]
+        if len(filtered) != len(mapping):
+            register_checkpoint_conversion_mapping(
+                "nemotron_h", filtered, overwrite=True
+            )
+            LOG.info(
+                "Removed embedding→embeddings WeightRenaming from nemotron_h "
+                "checkpoint conversion mapping"
+            )
 
     def _apply_fp8_patches(self):
         """Apply patches for FP8 support."""
